@@ -1,0 +1,69 @@
+/**** Start of imports. If edited, may not auto-convert in the playground. ****/
+var table = ee.FeatureCollection("projects/ee-aliasgis/assets/miseonnamu_cb_gb");
+/***** End of imports. If edited, may not auto-convert in the playground. *****/
+// [1] Korean Region AOI
+var roi = ee.FeatureCollection("USDOS/LSIB_SIMPLE/2017")
+  .filter(ee.Filter.inList("country_na", ["Korea, South", "Korea, North"]))
+  .geometry();
+// [2] SPECIES presence points (geometry)//asset upload layer 
+var raw = ee.FeatureCollection(table);
+var presence = raw.map(function(f) {
+  var lat = ee.Number(f.get('lat'));
+  var lon = ee.Number(f.get('lon'));
+  var geom = ee.Geometry.Point([lon, lat]);
+  return ee.Feature(geom, {'presence': 1});
+});
+// [3] absence (background) point
+var absence = ee.FeatureCollection.randomPoints({
+  region: roi,
+  points: 500,
+  seed: 42
+}).map(function(pt) {
+  return pt.set({'presence': 0});  
+});
+
+// [4] presence + absence merge
+var allPoints = presence.merge(absence);
+// [5]  Sentinel-2 collection band
+var bands = ['B2', 'B3', 'B4', 'B8', 'B11', 'B12'];  // Blue, Green, Red, NIR, SWIR1, SWIR2
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterBounds(roi)
+  .filterDate('2023-06-01', '2023-08-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10))
+  .map(function(image) {
+    return image.select(bands).copyProperties(image, ['system:time_start']);
+  })
+  .median();
+
+var ndvi = s2.normalizedDifference(["B8", "B4"]).rename("NDVI");
+var dem = ee.Image("USGS/SRTMGL1_003").clip(roi).rename("elevation");
+var env = ndvi.addBands(dem);
+
+// [6] sample
+var training = env.sampleRegions({
+  collection: allPoints,
+  properties: ['presence'],
+  scale: 30
+});
+
+// [7] Maxent 
+var classifier = ee.Classifier.amnhMaxent().train({
+  features: training,
+  classProperty: "presence",
+  inputProperties: ["NDVI", "elevation"]
+});
+
+// [8] run classify
+var prediction = env.classify(classifier);
+
+// [9] layer load
+Map.centerObject(roi, 7);
+Map.addLayer(prediction.select(0).clip(roi), {
+  min: 0,
+  max: 1,
+  palette: ['white', 'green']
+}, "🧪 미선나무 서식 예측(Maxent)");
+
+Map.addLayer(presence, {color: 'red'}, "Presence Points");
+Map.addLayer(absence, {color: 'blue'}, "Background Points");
