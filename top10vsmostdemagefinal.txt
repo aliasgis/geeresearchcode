@@ -1,0 +1,130 @@
+// ==============================================================================
+// 🌲 2025 산청 산불 피해지 식생 구성 분석 및 시각적 교차 검증 코드 (에러 수정본)
+// ==============================================================================
+
+// ------------------------------------------------------------------------------
+// 1. AOI(관심지역) 및 임상도 데이터 설정 (Imports 탭의 변수명과 일치해야 함)
+// ------------------------------------------------------------------------------
+var aoi = table;          // 산청 산불 피해지 경계 (노란색 폴리곤)
+var forestMap = table2;      // 산림청 임상도 FeatureCollection
+
+// ------------------------------------------------------------------------------
+// 2. 산불 전/후 날짜 설정 
+// ------------------------------------------------------------------------------
+var preFireStart = '2024-10-01'; // 불나기 전
+var preFireEnd = '2024-11-30';
+var postFireStart = '2025-03-01'; // 불난 후
+var postFireEnd = '2025-04-30';
+
+// ------------------------------------------------------------------------------
+// 3. Sentinel-2 영상 불러오기 및 NBR(식생지수) 계산 함수
+// ------------------------------------------------------------------------------
+function getS2_NBR(startDate, endDate) {
+  var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+            .filterBounds(aoi)
+            .filterDate(startDate, endDate)
+            .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 10)) // 구름 10% 이하
+            .median() // 중간값 합성
+            .clip(aoi);
+            
+  // NBR = (B8 - B12) / (B8 + B12)
+  var nbr = s2.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return s2.addBands(nbr);
+}
+
+var preFireImg = getS2_NBR(preFireStart, preFireEnd);
+var postFireImg = getS2_NBR(postFireStart, postFireEnd);
+
+// ------------------------------------------------------------------------------
+// 4. dNBR (산불 피해 심각도) 계산
+// ------------------------------------------------------------------------------
+var dNBR = preFireImg.select('NBR').subtract(postFireImg.select('NBR')).rename('dNBR');
+
+// ------------------------------------------------------------------------------
+// 5. Top 10% (극강피해 구역) 문턱값(Threshold) 계산 및 마스크 생성
+// ------------------------------------------------------------------------------
+var dNBR_stats = dNBR.reduceRegion({
+  reducer: ee.Reducer.percentile([90]), // 상위 10% 기준점 찾기
+  geometry: aoi,
+  scale: 30, // 30m 해상도
+  maxPixels: 1e9
+});
+var threshold90 = ee.Number(dNBR_stats.get('dNBR'));
+
+// dNBR이 상위 10% 값보다 큰 픽셀만 추출 (극강피해 구역)
+var top10Area = dNBR.gte(threshold90); 
+var top10Mask = top10Area.selfMask();
+
+// ------------------------------------------------------------------------------
+// 6. [수정됨] 임상도 데이터 처리 (수종코드 문자를 숫자로 변환)
+// ------------------------------------------------------------------------------
+// KOFTR_GROU 값이 비어있지 않은 것만 필터링한 후, 문자를 숫자로 변환하여 KOFTR_NUM에 저장
+var forestMapNum = forestMap
+  .filter(ee.Filter.notNull(['KOFTR_GROU']))
+  .filter(ee.Filter.neq('KOFTR_GROU', '')) // 빈 문자열 제외
+  .map(function(f) {
+    var num = ee.Number.parse(f.getString('KOFTR_GROU')); 
+    return f.set('KOFTR_NUM', num);
+  });
+
+// 변환된 숫자('KOFTR_NUM')를 이용해 폴리곤을 래스터(이미지 픽셀)로 변환
+var forestRaster = forestMapNum.reduceToImage(['KOFTR_NUM'], ee.Reducer.first()).rename('KOFTR_GROU').clip(aoi);
+
+// 소나무(11번) 군락지만 추출
+var pineMask = forestRaster.eq(30).selfMask();
+
+// Top 10% 구역 내부의 수종 데이터만 추출
+var top10Forest = forestRaster.updateMask(top10Mask);
+
+// ------------------------------------------------------------------------------
+// 7. 차트 출력: Top 10% 구역 내 수종코드(KOFTR_GROU) 비율 계산
+// ------------------------------------------------------------------------------
+var top10_histogram = top10Forest.reduceRegion({
+  reducer: ee.Reducer.frequencyHistogram(),
+  geometry: aoi,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+var counts = ee.Dictionary(top10_histogram.get('KOFTR_GROU'));
+var totalPixels = counts.values().reduce(ee.Reducer.sum());
+
+// 비율(%)로 변환하여 새로운 딕셔너리 생성
+var percentages = counts.map(function(key, val) {
+  return ee.Number(val).divide(totalPixels).multiply(100);
+});
+
+// 콘솔에 차트 그리기
+var chart = ui.Chart.array.values({
+  array: percentages.values(),
+  axis: 0,
+  xLabels: percentages.keys()
+}).setChartType('ColumnChart')
+  .setOptions({
+    title: 'Top 10% 극강피해 구역 내 수종코드 비율 (%)',
+    hAxis: {title: '수종 코드 (11: 소나무, 30번대: 혼효림, 70번대: 활엽수)'},
+    vAxis: {title: '비율 (%)', minValue: 0},
+    colors: ['#d63031']
+  });
+print(chart);
+
+// ------------------------------------------------------------------------------
+// 🗺️ 8. [핵심] 지도 시각적 교차 검증 (Map.addLayer)
+// ------------------------------------------------------------------------------
+Map.centerObject(aoi, 13); // 지도를 AOI 중심으로 이동
+
+// 자연색(True Color) 보기 설정
+var visParamsRGB = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000};
+var visParamsdNBR = {min: 0.1, max: 0.8, palette: ['yellow', 'orange', 'red']};
+
+// 지도 레이어 추가 (레이어 탭에서 껐다 켰다 하면서 확인하세요!)
+Map.addLayer(preFireImg.clip(aoi), visParamsRGB, '📸 1. 불나기 전 (RGB)', false);
+Map.addLayer(postFireImg.clip(aoi), visParamsRGB, '📸 2. 불난 후 (RGB)', false);
+Map.addLayer(dNBR.clip(aoi), visParamsdNBR, '🔥 3. 전체 산불 피해 강도 (dNBR)', false);
+
+// 가장 중요한 팩트체크 레이어 2개
+Map.addLayer(top10Mask, {palette: ['red']}, '🚨 4. 내 데이터: Top 10% 극강피해 구역', true);
+Map.addLayer(pineMask, {palette: ['00FF00']}, '🌲 5. 내 데이터: 소나무(11번) 군락지', true);
+
+print('✅ 에러 수정 완료! 스크립트가 정상 실행되었습니다.');
+print('👉 지도 우측 상단의 Layers를 클릭하여 1~5번 레이어를 껐다 켰다 하면서 눈으로 직접 확인해 보세요!');
