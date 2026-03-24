@@ -640,484 +640,297 @@ Export.image.toDrive({
   maxPixels: 1e13
 });
 
-Export.image.toDrive({
-  image: forestGroupRaster.toInt8(),
-  description: 'Sancheong_ForestGroup_Raster',
-  folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_ForestGroup_Raster',
-  region: aoi,
-  scale: 10,
-  maxPixels: 1e13
-});
 /************************************************************
- * 자동 해석문 생성 + 종합 판정
- ************************************************************/
-
-function safeGetPercent(fc, groupName) {
-  var filtered = fc.filter(ee.Filter.eq('group', groupName));
-  return ee.Number(ee.Algorithms.If(
-    filtered.size().gt(0),
-    filtered.first().get('percent'),
-    0
-  ));
-}
-
-function makeInterpretation(resultObj, label) {
-  var conifer = safeGetPercent(resultObj.finalFc, '침엽수림');
-  var mixed = safeGetPercent(resultObj.finalFc, '혼효림');
-  var broad = safeGetPercent(resultObj.finalFc, '활엽수림');
-  var other = safeGetPercent(resultObj.finalFc, '기타');
-
-  var dominant = ee.String(
-    ee.Algorithms.If(
-      conifer.gte(mixed).and(conifer.gte(broad)).and(conifer.gte(other)), '침엽수림',
-      ee.Algorithms.If(
-        mixed.gte(conifer).and(mixed.gte(broad)).and(mixed.gte(other)), '혼효림',
-        ee.Algorithms.If(
-          broad.gte(conifer).and(broad.gte(mixed)).and(broad.gte(other)), '활엽수림',
-          '기타'
-        )
-      )
-    )
-  );
-
-  var sentence = ee.String('threshold ').cat(label)
-    .cat('에서 수관화 후보지역 면적은 ')
-    .cat(ee.Number(resultObj.crownAreaHa).format('%.2f')).cat(' ha이며, ')
-    .cat('침엽수림 ')
-    .cat(conifer.format('%.2f')).cat('%, ')
-    .cat('혼효림 ')
-    .cat(mixed.format('%.2f')).cat('%, ')
-    .cat('활엽수림 ')
-    .cat(broad.format('%.2f')).cat('%, ')
-    .cat('기타 ')
-    .cat(other.format('%.2f')).cat('%로 나타났다. ')
-    .cat('가장 높은 비중은 ')
-    .cat(dominant)
-    .cat('이다.');
-
-  return ee.Feature(null, {
-    threshold: label,
-    crown_area_ha: resultObj.crownAreaHa,
-    conifer_pct: conifer,
-    mixed_pct: mixed,
-    broadleaf_pct: broad,
-    other_pct: other,
-    dominant_group: dominant,
-    interpretation: sentence
-  });
-}
-
-// 1) 해석문 Feature 먼저 생성
-var interp044 = makeInterpretation(result044, '0.44');
-var interp050 = makeInterpretation(result050, '0.50');
-var interp066 = makeInterpretation(result066, '0.66');
-
-// 2) 묶어서 출력
-var interpretationFc = ee.FeatureCollection([interp044, interp050, interp066]);
-
-print('===== 자동 해석문 =====', interpretationFc);
-print('해석문 0.44', interp044.get('interpretation'));
-print('해석문 0.50', interp050.get('interpretation'));
-print('해석문 0.66', interp066.get('interpretation'));
-
-// 3) 종합 판정
-
-var dom044 = ee.String(interp044.get('dominant_group'));
-var dom050 = ee.String(interp050.get('dominant_group'));
-var dom066 = ee.String(interp066.get('dominant_group'));
-
-var same1 = ee.Algorithms.IsEqual(dom044, dom050);
-var same2 = ee.Algorithms.IsEqual(dom050, dom066);
-
-// same1이 true일 때만 same2를 검사
-var isSame = ee.Algorithms.If(same1, same2, false);
-
-var stableMsg = ee.String(
-  ee.Algorithms.If(
-    isSame,
-    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
-      .cat(dom044)
-      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
-    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
-  )
-);
-
-print('===== 종합 판정 =====', stableMsg);
-var stableMsg = ee.String(
-  ee.Algorithms.If(
-    isSame,
-    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
-      .cat(dom044)
-      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
-    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
-  )
-);
-
-print('===== 종합 판정 =====', stableMsg);
-
-var stableMsg = ee.String(
-  ee.Algorithms.If(
-    isSame,
-    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
-      .cat(dom044)
-      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
-    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
-  )
-);
-
-print('===== 종합 판정 =====', stableMsg);
-
-// 4) export
-Export.table.toDrive({
-  collection: interpretationFc,
-  description: 'Sancheong_Threshold_Interpretation',
-  folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_Threshold_Interpretation',
-  fileFormat: 'CSV'
-});
-/************************************************************
- * AOI 전체 식생구성 vs 수관화 후보지역 식생구성 vs 피해 선택성
- * - threshold 0.44 / 0.50 / 0.66 비교
+ * 바람 자료 기반 확산경로 해석
+ * - ERA5 Hourly 사용
  * - 기존 코드 뒤에 추가
+ *
+ * 참고:
+ *   ECMWF/ERA5/HOURLY
+ *   bands:
+ *     u_component_of_wind_10m
+ *     v_component_of_wind_10m
  ************************************************************/
 
 // ==========================================================
-// 1. AOI 전체 식생구성 계산
+// 1. 분석 기간 설정
+//    산불 확산 핵심 기간으로 조정 가능
 // ==========================================================
-var aoiAreaImage = ee.Image.pixelArea().divide(10000)
-  .rename('area_ha')
-  .addBands(forestRaster);
+var WIND_START = '2025-03-21T00:00:00';
+var WIND_END   = '2025-03-28T00:00:00';
 
-var aoiGrouped = aoiAreaImage.reduceRegion({
-  reducer: ee.Reducer.sum().group({
-    groupField: 1,
-    groupName: 'class'
-  }),
+// 확산축 계산에 사용할 burn mask
+// 보통 0.50 또는 0.66 추천
+var burnMaskForAxis = result050.crownMaskClean.rename('burn_axis_mask');
+
+// ==========================================================
+// 2. ERA5 Hourly 불러오기
+// ==========================================================
+var era5 = ee.ImageCollection('ECMWF/ERA5/HOURLY')
+  .filterDate(WIND_START, WIND_END)
+  .filterBounds(aoi)
+  .select(['u_component_of_wind_10m', 'v_component_of_wind_10m']);
+
+print('ERA5 hourly count', era5.size());
+
+// 평균 바람장
+var windMean = era5.mean().clip(aoi);
+
+var u10 = windMean.select('u_component_of_wind_10m').rename('u10');
+var v10 = windMean.select('v_component_of_wind_10m').rename('v10');
+
+// 풍속
+var windSpeed = u10.pow(2).add(v10.pow(2)).sqrt().rename('wind_speed');
+
+// 풍향 (기상학 기준 "바람이 불어오는 방향"이 아니라,
+// 여기서는 벡터 진행방향 해석용 atan2(v,u) 사용)
+// degrees: -180 ~ 180
+var windDirTo = v10.atan2(u10)
+  .multiply(180 / Math.PI)
+  .rename('wind_dir_to_deg');
+
+// 0~360 정리
+windDirTo = windDirTo.where(windDirTo.lt(0), windDirTo.add(360))
+  .rename('wind_dir_to_deg_360');
+
+// ==========================================================
+// 3. AOI 평균 풍속/풍향
+// ==========================================================
+var windStats = ee.Image.cat([u10, v10, windSpeed, windDirTo]).reduceRegion({
+  reducer: ee.Reducer.mean(),
   geometry: aoi,
-  scale: 10,
+  scale: 30000,
   maxPixels: 1e13,
   tileScale: 4
 });
 
-var aoiGroups = ee.List(ee.Dictionary(aoiGrouped).get('groups', ee.List([])));
+var meanU = ee.Number(windStats.get('u10'));
+var meanV = ee.Number(windStats.get('v10'));
+var meanWindSpeed = ee.Number(windStats.get('wind_speed'));
+var meanWindDirTo = ee.Number(windStats.get('wind_dir_to_deg_360'));
 
-var aoiCodeFc = ee.FeatureCollection(aoiGroups.map(function(item) {
-  item = ee.Dictionary(item);
-  var cls = ee.Number(item.get('class')).toInt();
-  var areaHa = ee.Number(item.get('sum'));
-  return ee.Feature(null, {
-    KOFTR_GROU: cls,
-    area_ha: areaHa,
-    group: codeToGroup(cls)
-  });
-})).sort('KOFTR_GROU');
+print('===== 평균 바람 통계 =====');
+print('mean u10 (m/s)', meanU);
+print('mean v10 (m/s)', meanV);
+print('mean wind speed (m/s)', meanWindSpeed);
+print('mean wind direction TO (deg)', meanWindDirTo);
 
-var totalAoiForestArea = ee.Number(aoiCodeFc.aggregate_sum('area_ha'));
+// ==========================================================
+// 4. 바람 방향 라인 생성 (시각화)
+// ==========================================================
+// ==========================================================
+// ✔ 안전한 방향 라인 생성 함수 (GEE 호환)
+// ==========================================================
+function makeWindLine(centerGeom, azimuthDeg, lengthMeters) {
 
-aoiCodeFc = aoiCodeFc.map(function(f) {
-  var pct = ee.Number(f.get('area_ha')).divide(totalAoiForestArea).multiply(100);
-  return f.set('percent', pct);
+  var coords = ee.List(ee.Geometry(centerGeom).coordinates());
+  var lon = ee.Number(coords.get(0));
+  var lat = ee.Number(coords.get(1));
+
+  var azRad = ee.Number(azimuthDeg).multiply(Math.PI).divide(180);
+
+  // meter → degree 변환 (근사)
+  var dx = azRad.cos().multiply(lengthMeters).divide(111320);
+  var dy = azRad.sin().multiply(lengthMeters).divide(110540);
+
+  var p1 = ee.Geometry.Point([
+    lon.subtract(dx),
+    lat.subtract(dy)
+  ]);
+
+  var p2 = ee.Geometry.Point([
+    lon.add(dx),
+    lat.add(dy)
+  ]);
+
+  return ee.Geometry.LineString([
+    p1.coordinates(),
+    ee.Geometry(centerGeom).coordinates(),
+    p2.coordinates()
+  ]);
+}
+var centerPt = aoi.centroid(1);
+var windLine = makeWindLine(centerPt, meanWindDirTo, 15000);
+
+Map.addLayer(windSpeed, {
+  min: 0,
+  max: 10,
+  palette: ['white', 'lightblue', 'blue', 'purple']
+}, 'ERA5 mean wind speed', false);
+
+Map.addLayer(windLine, {color: '00FFFF'}, 'Mean wind direction line');
+
+// ==========================================================
+// 5. 강피해 축 방향 추정
+//    burnMask 픽셀 좌표 기반 PCA 유사 계산
+// ==========================================================
+
+// 좌표 이미지
+var lonLat = ee.Image.pixelLonLat().clip(aoi);
+
+// burn pixel 샘플
+var burnCoordSamples = lonLat.updateMask(burnMaskForAxis).sample({
+  region: aoi,
+  scale: 30,
+  numPixels: 8000,
+  seed: 42,
+  geometries: false,
+  tileScale: 4
 });
 
-print('===== AOI 전체 코드별 식생구성 =====', aoiCodeFc);
+print('burnCoordSamples count', burnCoordSamples.size());
+
+// 평균 중심
+var meanLon = ee.Number(burnCoordSamples.aggregate_mean('longitude'));
+var meanLat = ee.Number(burnCoordSamples.aggregate_mean('latitude'));
+
+// 편차 부여
+var burnCentered = burnCoordSamples.map(function(f) {
+  var x = ee.Number(f.get('longitude')).subtract(meanLon);
+  var y = ee.Number(f.get('latitude')).subtract(meanLat);
+  return f.set({
+    x: x,
+    y: y,
+    xx: x.multiply(x),
+    yy: y.multiply(y),
+    xy: x.multiply(y)
+  });
+});
+
+// 공분산 성분
+var sxx = ee.Number(burnCentered.aggregate_mean('xx'));
+var syy = ee.Number(burnCentered.aggregate_mean('yy'));
+var sxy = ee.Number(burnCentered.aggregate_mean('xy'));
+
+// 주축 각도 (degrees)
+// theta = 0.5 * atan2(2*sxy, sxx-syy)
+var axisThetaRad = ee.Number(0.5).multiply(
+  ee.Number(2).multiply(sxy).atan2(sxx.subtract(syy))
+);
+
+var axisThetaDeg = axisThetaRad.multiply(180 / Math.PI);
+axisThetaDeg = ee.Number(
+  ee.Algorithms.If(axisThetaDeg.lt(0), axisThetaDeg.add(180), axisThetaDeg)
+);
+
+print('===== 강피해 축 방향 =====');
+print('burn-axis angle (deg, 0~180)', axisThetaDeg);
+
+// 축 라인 생성
+var burnAxisLine = makeWindLine(centerPt, axisThetaDeg, 15000);
+Map.addLayer(burnAxisLine, {color: 'FF00FF'}, 'Burn axis line');
 
 // ==========================================================
-// 2. AOI 전체 그룹별(침엽/혼효/활엽/기타) 집계
+// 6. 풍향과 확산축 차이 계산
+//    축은 180도 대칭이라 최소 차이 사용
 // ==========================================================
-function sumGroupPercent(fc, groupName) {
+function angleDiff180(a, b) {
+  a = ee.Number(a);
+  b = ee.Number(b);
+  var diff = a.subtract(b).abs();
   return ee.Number(
-    fc.filter(ee.Filter.eq('group', groupName)).aggregate_sum('percent')
+    ee.Algorithms.If(diff.gt(90), ee.Number(180).subtract(diff), diff)
   );
 }
 
-function sumGroupArea(fc, groupName) {
-  return ee.Number(
-    fc.filter(ee.Filter.eq('group', groupName)).aggregate_sum('area_ha')
-  );
-}
+// 풍향은 0~360이므로 축 비교용 0~180으로 축소
+var windAxisDeg = ee.Number(
+  ee.Algorithms.If(meanWindDirTo.gt(180), meanWindDirTo.subtract(180), meanWindDirTo)
+);
 
-var aoiFinalFc = ee.FeatureCollection([
+var axisDiff = angleDiff180(windAxisDeg, axisThetaDeg);
+
+print('wind axis deg (0~180)', windAxisDeg);
+print('angle difference between wind and burn axis (deg)', axisDiff);
+
+// ==========================================================
+// 7. 방향성 해석문
+// ==========================================================
+var axisInterpretation = ee.String(
+  ee.Algorithms.If(
+    axisDiff.lte(20),
+    '평균 풍향과 강피해 확산축의 차이가 작아, 사건 기간의 지배적 바람이 확산 경로 형성에 강하게 작용했을 가능성이 크다.',
+    ee.Algorithms.If(
+      axisDiff.lte(45),
+      '평균 풍향과 강피해 확산축이 부분적으로 일치하여, 바람이 확산 방향에 일정 부분 영향을 주었을 가능성이 있다.',
+      '평균 풍향과 강피해 확산축의 차이가 커서, 바람 외에 지형·연료연속성·발화위치 등의 영향이 더 컸을 가능성이 있다.'
+    )
+  )
+);
+
+print('===== 바람-확산축 해석 =====', axisInterpretation);
+
+// ==========================================================
+// 8. 식생 + 바람 + 지형 비교용 요약 Feature
+// ==========================================================
+var windSummary = ee.FeatureCollection([
   ee.Feature(null, {
-    scope: 'AOI 전체',
-    group: '침엽수림',
-    area_ha: sumGroupArea(aoiCodeFc, '침엽수림'),
-    percent: sumGroupPercent(aoiCodeFc, '침엽수림')
-  }),
-  ee.Feature(null, {
-    scope: 'AOI 전체',
-    group: '혼효림',
-    area_ha: sumGroupArea(aoiCodeFc, '혼효림'),
-    percent: sumGroupPercent(aoiCodeFc, '혼효림')
-  }),
-  ee.Feature(null, {
-    scope: 'AOI 전체',
-    group: '활엽수림',
-    area_ha: sumGroupArea(aoiCodeFc, '활엽수림'),
-    percent: sumGroupPercent(aoiCodeFc, '활엽수림')
-  }),
-  ee.Feature(null, {
-    scope: 'AOI 전체',
-    group: '기타',
-    area_ha: sumGroupArea(aoiCodeFc, '기타'),
-    percent: sumGroupPercent(aoiCodeFc, '기타')
+    period_start: WIND_START,
+    period_end: WIND_END,
+    mean_u10_mps: meanU,
+    mean_v10_mps: meanV,
+    mean_wind_speed_mps: meanWindSpeed,
+    mean_wind_dir_to_deg: meanWindDirTo,
+    burn_axis_deg_0_180: axisThetaDeg,
+    wind_axis_deg_0_180: windAxisDeg,
+    axis_difference_deg: axisDiff,
+    interpretation: axisInterpretation
   })
 ]);
 
-print('===== AOI 전체 그룹별 식생구성 =====', aoiFinalFc);
+print('===== wind summary =====', windSummary);
 
 // ==========================================================
-// 3. AOI 대비 피해 선택성 계산 함수
-//    선택성 = 수관화 후보지역 비율 / AOI 전체 비율
+// 9. 차트: 시간별 풍속
 // ==========================================================
-function buildSelectivityFc(resultObj, thrLabel) {
-  var burnFc = resultObj.finalFc;
+var era5TimeSeries = era5.map(function(img) {
+  var ws = img.select('u_component_of_wind_10m').pow(2)
+    .add(img.select('v_component_of_wind_10m').pow(2))
+    .sqrt()
+    .rename('ws');
 
-  function getBurnPct(groupName) {
-    var filtered = burnFc.filter(ee.Filter.eq('group', groupName));
-    return ee.Number(ee.Algorithms.If(
-      filtered.size().gt(0),
-      filtered.first().get('percent'),
-      0
-    ));
-  }
-
-  function getAoiPct(groupName) {
-    var filtered = aoiFinalFc.filter(ee.Filter.eq('group', groupName));
-    return ee.Number(ee.Algorithms.If(
-      filtered.size().gt(0),
-      filtered.first().get('percent'),
-      0
-    ));
-  }
-
-  function makeOne(groupName) {
-    var aoiPct = getAoiPct(groupName);
-    var burnPct = getBurnPct(groupName);
-
-    var selectivity = ee.Number(
-      ee.Algorithms.If(
-        aoiPct.gt(0),
-        burnPct.divide(aoiPct),
-        0
-      )
-    );
-
-    var interpretation = ee.String(
-      ee.Algorithms.If(
-        selectivity.gt(1.05),
-        '원래 분포보다 수관화 후보지역에 더 많이 포함됨',
-        ee.Algorithms.If(
-          selectivity.lt(0.95),
-          '원래 분포보다 수관화 후보지역에 덜 포함됨',
-          '원래 분포와 유사한 수준'
-        )
-      )
-    );
-
-    return ee.Feature(null, {
-      threshold: thrLabel,
-      group: groupName,
-      aoi_percent: aoiPct,
-      burn_percent: burnPct,
-      selectivity_index: selectivity,
-      interpretation: interpretation
-    });
-  }
-
-  return ee.FeatureCollection([
-    makeOne('침엽수림'),
-    makeOne('혼효림'),
-    makeOne('활엽수림'),
-    makeOne('기타')
-  ]);
-}
-
-// ==========================================================
-// 4. threshold별 선택성 계산
-// ==========================================================
-var sel044 = buildSelectivityFc(result044, '0.44');
-var sel050 = buildSelectivityFc(result050, '0.50');
-var sel066 = buildSelectivityFc(result066, '0.66');
-
-var selectivityAll = sel044.merge(sel050).merge(sel066);
-
-print('===== 피해 선택성 결과 =====', selectivityAll);
-
-// ==========================================================
-// 5. AOI 전체 vs 수관화 후보지 비교표 생성
-// ==========================================================
-function buildComparisonFc(resultObj, thrLabel) {
-  var burnFc = resultObj.finalFc;
-
-  function getBurn(groupName) {
-    var filtered = burnFc.filter(ee.Filter.eq('group', groupName));
-    return ee.Feature(ee.Algorithms.If(
-      filtered.size().gt(0),
-      filtered.first(),
-      ee.Feature(null, {group: groupName, area_ha: 0, percent: 0})
-    ));
-  }
-
-  function getAoi(groupName) {
-    var filtered = aoiFinalFc.filter(ee.Filter.eq('group', groupName));
-    return ee.Feature(ee.Algorithms.If(
-      filtered.size().gt(0),
-      filtered.first(),
-      ee.Feature(null, {group: groupName, area_ha: 0, percent: 0})
-    ));
-  }
-
-  function makeCompare(groupName) {
-    var aoiF = getAoi(groupName);
-    var burnF = getBurn(groupName);
-
-    return ee.Feature(null, {
-      threshold: thrLabel,
-      group: groupName,
-      aoi_area_ha: aoiF.get('area_ha'),
-      aoi_percent: aoiF.get('percent'),
-      burn_area_ha: burnF.get('area_ha'),
-      burn_percent: burnF.get('percent')
-    });
-  }
-
-  return ee.FeatureCollection([
-    makeCompare('침엽수림'),
-    makeCompare('혼효림'),
-    makeCompare('활엽수림'),
-    makeCompare('기타')
-  ]);
-}
-
-var compare044 = buildComparisonFc(result044, '0.44');
-var compare050 = buildComparisonFc(result050, '0.50');
-var compare066 = buildComparisonFc(result066, '0.66');
-
-var comparisonAll = compare044.merge(compare050).merge(compare066);
-
-print('===== AOI 전체 vs 수관화 후보지 비교 =====', comparisonAll);
-
-// ==========================================================
-// 6. 해석문 생성
-// ==========================================================
-function buildSelectivitySentence(selFc, thrLabel) {
-  function getOne(groupName) {
-    var f = ee.Feature(selFc.filter(ee.Filter.eq('group', groupName)).first());
-    return {
-      aoiPct: ee.Number(f.get('aoi_percent')),
-      burnPct: ee.Number(f.get('burn_percent')),
-      sel: ee.Number(f.get('selectivity_index')),
-      interp: ee.String(f.get('interpretation'))
-    };
-  }
-
-  var con = getOne('침엽수림');
-  var mix = getOne('혼효림');
-  var bro = getOne('활엽수림');
-
-  var sentence = ee.String('threshold ').cat(thrLabel)
-    .cat('에서 AOI 전체 대비 수관화 후보지역의 식생 선택성을 비교한 결과, ')
-    .cat('침엽수림 선택성 지수는 ')
-    .cat(con.sel.format('%.2f')).cat(', ')
-    .cat('혼효림은 ')
-    .cat(mix.sel.format('%.2f')).cat(', ')
-    .cat('활엽수림은 ')
-    .cat(bro.sel.format('%.2f')).cat('로 나타났다. ')
-    .cat('이는 활엽수림이 AOI 전체 분포 대비 수관화 후보지역에서 ')
-    .cat(bro.interp)
-    .cat('는 의미이다.');
+  var stat = ws.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 30000,
+    maxPixels: 1e13
+  });
 
   return ee.Feature(null, {
-    threshold: thrLabel,
-    interpretation: sentence
+    time: img.date().format('YYYY-MM-dd HH:mm'),
+    ws: stat.get('ws')
   });
-}
-
-var selSentence044 = buildSelectivitySentence(sel044, '0.44');
-var selSentence050 = buildSelectivitySentence(sel050, '0.50');
-var selSentence066 = buildSelectivitySentence(sel066, '0.66');
-
-var selectivitySentenceFc = ee.FeatureCollection([
-  selSentence044, selSentence050, selSentence066
-]);
-
-print('===== 선택성 해석문 =====', selectivitySentenceFc);
-print('선택성 해석문 0.44', selSentence044.get('interpretation'));
-print('선택성 해석문 0.50', selSentence050.get('interpretation'));
-print('선택성 해석문 0.66', selSentence066.get('interpretation'));
-
-// ==========================================================
-// 7. 차트
-// ==========================================================
-var chartAoiVsBurn = ui.Chart.feature.groups({
-  features: comparisonAll,
-  xProperty: 'group',
-  yProperty: 'burn_percent',
-  seriesProperty: 'threshold'
-})
-.setChartType('ColumnChart')
-.setOptions({
-  title: 'threshold별 수관화 후보지역 식생 비율(%)',
-  hAxis: {title: 'Forest Type'},
-  vAxis: {title: 'Burn Percent'}
 });
-print(chartAoiVsBurn);
 
-var chartSelectivity = ui.Chart.feature.groups({
-  features: selectivityAll,
-  xProperty: 'group',
-  yProperty: 'selectivity_index',
-  seriesProperty: 'threshold'
-})
-.setChartType('ColumnChart')
-.setOptions({
-  title: 'threshold별 피해 선택성 지수',
-  hAxis: {title: 'Forest Type'},
-  vAxis: {title: 'Selectivity Index'},
-  bar: {groupWidth: '70%'}
-});
-print(chartSelectivity);
+var windTsChart = ui.Chart.feature.byFeature({
+  features: era5TimeSeries,
+  xProperty: 'time',
+  yProperties: ['ws']
+}).setChartType('LineChart')
+  .setOptions({
+    title: 'ERA5 hourly mean wind speed over AOI',
+    hAxis: {title: 'Time'},
+    vAxis: {title: 'Wind speed (m/s)'},
+    legend: {position: 'none'}
+  });
+
+print(windTsChart);
 
 // ==========================================================
-// 8. Export
+// 10. Export
 // ==========================================================
 Export.table.toDrive({
-  collection: aoiCodeFc,
-  description: 'Sancheong_AOI_KOFTR_GROU_Composition',
+  collection: windSummary,
+  description: 'Sancheong_Wind_Axis_Summary',
   folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_AOI_KOFTR_GROU_Composition',
+  fileNamePrefix: 'Sancheong_Wind_Axis_Summary',
   fileFormat: 'CSV'
 });
 
 Export.table.toDrive({
-  collection: aoiFinalFc,
-  description: 'Sancheong_AOI_ForestGroup_Composition',
+  collection: era5TimeSeries,
+  description: 'Sancheong_ERA5_Wind_Timeseries',
   folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_AOI_ForestGroup_Composition',
-  fileFormat: 'CSV'
-});
-
-Export.table.toDrive({
-  collection: comparisonAll,
-  description: 'Sancheong_AOI_vs_Burn_Comparison',
-  folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_AOI_vs_Burn_Comparison',
-  fileFormat: 'CSV'
-});
-
-Export.table.toDrive({
-  collection: selectivityAll,
-  description: 'Sancheong_Forest_Selectivity',
-  folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_Forest_Selectivity',
-  fileFormat: 'CSV'
-});
-
-Export.table.toDrive({
-  collection: selectivitySentenceFc,
-  description: 'Sancheong_Forest_Selectivity_Interpretation',
-  folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_Forest_Selectivity_Interpretation',
+  fileNamePrefix: 'Sancheong_ERA5_Wind_Timeseries',
   fileFormat: 'CSV'
 });
