@@ -1,357 +1,36 @@
-/************************************************************
- * 산청 산불 공개검증용 전체 통합 코드
- * ----------------------------------------------------------
- * 입력:
- *   - geometry : 분석 AOI
- *   - table    : 임상도 FeatureCollection
- *   - field    : KOFTR_GROU
- *
- * 기능:
- *   1) Sentinel-2 전/후 영상 합성
- *   2) dNBR 계산
- *   3) 수관화 후보지역 추출
- *   4) KOFTR_GROU 코드별 면적/비율 계산
- *   5) 침엽/혼효/활엽/기타로 재집계
- *   6) 차트 출력
- *   7) CSV / raster export
- ************************************************************/
+print(chartFinalCompare);
 
-Map.setOptions('SATELLITE');
-
-// ==========================================================
-// 0. 사용자 설정
-// ==========================================================
-var aoi = geometry;
-var forestField = 'KOFTR_GROU';
-
-// 산불 전/후 날짜
-var PRE_START  = '2025-02-01';
-var PRE_END    = '2025-03-15';
-var POST_START = '2025-03-25';
-var POST_END   = '2025-04-20';
-
-// dNBR threshold
-var DNBR_THRESHOLD = 0.44;
-
-// 표시용 팔레트
-var forestPalette = [
-  'bdbdbd', // 0 Other
-  '0b5d1e', // 1 Conifer
-  'ffd92f', // 2 Mixed
-  '8ddf74'  // 3 Broadleaf
-];
-
-// ==========================================================
-// 1. 기본 정보
-// ==========================================================
-Map.centerObject(aoi, 11);
-
-print('AOI area (ha)', ee.Number(aoi.area()).divide(10000));
-print('table sample', table.limit(5));
-print('property names', ee.Feature(table.first()).propertyNames());
-
-var forestMap = table.filterBounds(aoi);
-print('forestMap count', forestMap.size());
-print('KOFTR_GROU histogram', forestMap.aggregate_histogram(forestField));
-
-// ==========================================================
-// 2. Sentinel-2 전처리
-// ==========================================================
-function maskS2sr(img) {
-  var scl = img.select('SCL');
-
-  var mask = scl.neq(0)
-    .and(scl.neq(1))
-    .and(scl.neq(3))
-    .and(scl.neq(8))
-    .and(scl.neq(9))
-    .and(scl.neq(10))
-    .and(scl.neq(11));
-
-  return img.updateMask(mask)
-    .divide(10000)
-    .copyProperties(img, ['system:time_start']);
-}
-
-function addIndices(img) {
-  var nbr = img.normalizedDifference(['B8', 'B12']).rename('NBR');
-  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
-  return img.addBands([nbr, ndvi]);
-}
-
-function getComposite(startDate, endDate, region, label) {
-  var col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-    .filterBounds(region)
-    .filterDate(startDate, endDate)
-    .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 30))
-    .map(maskS2sr)
-    .map(addIndices);
-
-  print(label + ' image count', col.size());
-
-  var empty = ee.Image.constant([0,0,0,0,0,0,0,0,0,0,0,0])
-    .rename(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12','NBR','NDVI'])
-    .toFloat()
-    .clip(region);
-
-  var comp = ee.Image(ee.Algorithms.If(
-    col.size().gt(0),
-    col.median().clip(region),
-    empty
-  ));
-
-  return comp;
-}
-
-// ==========================================================
-// 3. 전/후 영상 합성
-// ==========================================================
-var pre = getComposite(PRE_START, PRE_END, aoi, 'PRE');
-var post = getComposite(POST_START, POST_END, aoi, 'POST');
-
-// ==========================================================
-// 4. dNBR 및 수관화 후보지역
-// ==========================================================
-var preNBR = pre.select('NBR');
-var postNBR = post.select('NBR');
-var dNBR = preNBR.subtract(postNBR).rename('dNBR');
-
-var crownFireMask = dNBR.gte(DNBR_THRESHOLD).selfMask().rename('crown_fire');
-
-var crownFireMaskClean = crownFireMask
-  .focal_max({radius: 1, units: 'pixels'})
-  .focal_min({radius: 1, units: 'pixels'})
-  .rename('crown_fire_clean');
-
-var crownAreaHa = ee.Number(
-  ee.Image.pixelArea()
-    .updateMask(crownFireMaskClean)
-    .reduceRegion({
-      reducer: ee.Reducer.sum(),
-      geometry: aoi,
-      scale: 10,
-      maxPixels: 1e13,
-      tileScale: 4
-    })
-    .values()
-    .get(0)
-).divide(10000);
-
-print('Crown-fire candidate area (ha)', crownAreaHa);
-
-// ==========================================================
-// 5. KOFTR_GROU 숫자화
-// ==========================================================
-var forestMapCoded = forestMap.map(function(f) {
-  var raw = f.get(forestField);
-  var code = ee.Number.parse(ee.String(raw));
-  return f.set({
-    forest_code: code,
-    forest_code_raw: raw
-  });
+var chartAreaCompare = ui.Chart.feature.byFeature({
+  features: thresholdSummary,
+  xProperty: 'threshold',
+  yProperties: ['crown_area_ha']
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'threshold별 수관화 후보 면적(ha)',
+  legend: {position: 'none'},
+  hAxis: {title: 'threshold'},
+  vAxis: {title: 'Area (ha)'}
 });
+print(chartAreaCompare);
 
-print('forestMap coded sample', forestMapCoded.limit(10));
-print('forest_code histogram', forestMapCoded.aggregate_histogram('forest_code'));
-
-// ==========================================================
-// 6. 임상도 rasterize
-// ==========================================================
-var forestRaster = forestMapCoded
-  .reduceToImage({
-    properties: ['forest_code'],
-    reducer: ee.Reducer.first()
-  })
-  .rename('forest_type_code')
-  .clip(aoi)
-  .toInt16();
-
-print('forestRaster', forestRaster);
-
-// ==========================================================
-// 7. 수관화 후보지역 내부 KOFTR_GROU 코드별 집계
-// ==========================================================
-var areaImage = ee.Image.pixelArea().divide(10000)
-  .rename('area_ha')
-  .addBands(forestRaster)
-  .updateMask(crownFireMaskClean);
-
-var grouped = areaImage.reduceRegion({
-  reducer: ee.Reducer.sum().group({
-    groupField: 1,
-    groupName: 'class'
-  }),
-  geometry: aoi,
-  scale: 10,
-  maxPixels: 1e13,
-  tileScale: 4
-});
-
-print('Grouped area by KOFTR_GROU', grouped);
-
-// ==========================================================
-// 8. 코드별 결과표 생성
-// ==========================================================
-var groups = ee.List(ee.Dictionary(grouped).get('groups', ee.List([])));
-
-var resultFc = ee.FeatureCollection(groups.map(function(item) {
-  item = ee.Dictionary(item);
-  var cls = ee.Number(item.get('class')).toInt();
-  var areaHa = ee.Number(item.get('sum'));
-  var pct = ee.Algorithms.If(
-    crownAreaHa.gt(0),
-    areaHa.divide(crownAreaHa).multiply(100),
-    0
-  );
-
-  return ee.Feature(null, {
-    KOFTR_GROU: cls,
-    area_ha: areaHa,
-    percent: pct
-  });
-})).sort('KOFTR_GROU');
-
-print('Result table by KOFTR_GROU', resultFc);
-print('Top KOFTR_GROU by percent', resultFc.sort('percent', false).limit(20));
-
-// ==========================================================
-// 9. KOFTR_GROU → 침엽/혼효/활엽/기타 그룹화
-// 기준:
-//   침엽수림 = 11~19
-//   혼효림   = 30~39
-//   활엽수림 = 70~89
-//   기타     = 나머지
-// ==========================================================
-var groupedFinal = resultFc.map(function(f) {
-  var code = ee.Number(f.get('KOFTR_GROU'));
-  var pct  = ee.Number(f.get('percent'));
-  var area = ee.Number(f.get('area_ha'));
-
-  var group = ee.String(
-    ee.Algorithms.If(code.gte(11).and(code.lte(19)), '침엽수림',
-    ee.Algorithms.If(code.gte(30).and(code.lte(39)), '혼효림',
-    ee.Algorithms.If(code.gte(70).and(code.lte(89)), '활엽수림',
-    '기타')))
-  );
-
-  return f.set({
-    group: group,
-    percent_copy: pct,
-    area_copy: area
-  });
-});
-
-print('Grouped result', groupedFinal.limit(50));
-
-// ==========================================================
-// 10. 그룹별 합산
-// ==========================================================
-var coniferPct = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '침엽수림'))
-              .aggregate_sum('percent')
-);
-
-var mixedPct = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '혼효림'))
-              .aggregate_sum('percent')
-);
-
-var broadPct = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '활엽수림'))
-              .aggregate_sum('percent')
-);
-
-var otherPct = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '기타'))
-              .aggregate_sum('percent')
-);
-
-var coniferArea = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '침엽수림'))
-              .aggregate_sum('area_ha')
-);
-
-var mixedArea = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '혼효림'))
-              .aggregate_sum('area_ha')
-);
-
-var broadArea = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '활엽수림'))
-              .aggregate_sum('area_ha')
-);
-
-var otherArea = ee.Number(
-  groupedFinal.filter(ee.Filter.eq('group', '기타'))
-              .aggregate_sum('area_ha')
-);
-
-// ==========================================================
-// 11. 최종 결과표
-// ==========================================================
-var finalFc = ee.FeatureCollection([
-  ee.Feature(null, {group: '침엽수림', area_ha: coniferArea, percent: coniferPct}),
-  ee.Feature(null, {group: '혼효림',   area_ha: mixedArea,   percent: mixedPct}),
-  ee.Feature(null, {group: '활엽수림', area_ha: broadArea,   percent: broadPct}),
-  ee.Feature(null, {group: '기타',     area_ha: otherArea,   percent: otherPct})
-]);
-
-print('===== 최종 결과 =====');
-print('침엽수림 (%)', coniferPct);
-print('혼효림 (%)', mixedPct);
-print('활엽수림 (%)', broadPct);
-print('기타 (%)', otherPct);
-print('Final grouped result', finalFc);
-
-// ==========================================================
-// 12. 그룹 raster 생성 (표시용)
-//   0 기타
-//   1 침엽수림
-//   2 혼효림
-//   3 활엽수림
-// ==========================================================
-var forestGroupRaster = forestRaster.expression(
-  "(b('forest_type_code') >= 11 && b('forest_type_code') <= 19) ? 1" +
-  ": (b('forest_type_code') >= 30 && b('forest_type_code') <= 39) ? 2" +
-  ": (b('forest_type_code') >= 70 && b('forest_type_code') <= 89) ? 3" +
-  ": 0"
-).rename('forest_group').toInt8();
-
-// ==========================================================
-// 13. 차트
-// ==========================================================
-var chartCode = ui.Chart.feature.byFeature({
-  features: resultFc,
+var chartTop10_044 = ui.Chart.feature.byFeature({
+  features: result044.top10,
   xProperty: 'KOFTR_GROU',
   yProperties: ['percent']
 })
 .setChartType('ColumnChart')
 .setOptions({
-  title: '수관화 후보지역 내부 KOFTR_GROU 비율(%)',
+  title: 'threshold 0.44 - TOP10 KOFTR_GROU',
   legend: {position: 'none'},
   hAxis: {title: 'KOFTR_GROU'},
   vAxis: {title: 'Percent'},
-  colors: ['#d73027']
+  colors: ['#2166ac']
 });
-print(chartCode);
-
-var chartFinal = ui.Chart.feature.byFeature({
-  features: finalFc,
-  xProperty: 'group',
-  yProperties: ['percent']
-})
-.setChartType('ColumnChart')
-.setOptions({
-  title: '수관화 후보지역 식생 구조(%)',
-  legend: {position: 'none'},
-  hAxis: {title: 'Forest Type'},
-  vAxis: {title: 'Percent'},
-  colors: ['#1b7837']
-});
-print(chartFinal);
+print(chartTop10_044);
 
 // ==========================================================
-// 14. 지도 표시
+// 15. 지도 표시
 // ==========================================================
 Map.addLayer(
   pre,
@@ -367,18 +46,28 @@ Map.addLayer(
 
 Map.addLayer(
   dNBR,
-  {
-    min: 0,
-    max: 0.8,
-    palette: ['white', 'yellow', 'orange', 'red', 'darkred']
-  },
+  {min: 0, max: 0.8, palette: ['white', 'yellow', 'orange', 'red', 'darkred']},
   'dNBR'
 );
 
 Map.addLayer(
-  crownFireMaskClean,
+  result044.crownMaskClean,
   {palette:['ff0000']},
-  'Crown-fire candidate'
+  'Crown-fire candidate (0.44)'
+);
+
+Map.addLayer(
+  result050.crownMaskClean,
+  {palette:['ff8800']},
+  'Crown-fire candidate (0.50)',
+  false
+);
+
+Map.addLayer(
+  result066.crownMaskClean,
+  {palette:['990000']},
+  'Crown-fire candidate (0.66)',
+  false
 );
 
 Map.addLayer(
@@ -390,11 +79,7 @@ Map.addLayer(
 
 Map.addLayer(
   forestGroupRaster,
-  {
-    min: 0,
-    max: 3,
-    palette: forestPalette
-  },
+  {min: 0, max: 3, palette: forestPalette},
   'Forest group raster',
   false
 );
@@ -409,19 +94,6 @@ Map.addLayer(
   'Forest polygons',
   false
 );
-
-// ==========================================================
-// 15. coverage 통계
-// ==========================================================
-var totalForestOverlapArea = ee.Number(resultFc.aggregate_sum('area_ha'));
-print('Total overlapped forest area in crown-fire mask (ha)', totalForestOverlapArea);
-
-var coveragePct = ee.Algorithms.If(
-  crownAreaHa.gt(0),
-  totalForestOverlapArea.divide(crownAreaHa).multiply(100),
-  0
-);
-print('Coverage by forest polygons within crown-fire mask (%)', coveragePct);
 
 // ==========================================================
 // 16. 범례
@@ -460,18 +132,42 @@ Map.add(legend);
 // 17. Export
 // ==========================================================
 Export.table.toDrive({
-  collection: resultFc,
-  description: 'Sancheong_CrownFire_KOFTR_GROU_Ratio',
+  collection: result044.resultFc,
+  description: 'Sancheong_CrownFire_KOFTR_GROU_Ratio_044',
   folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_CrownFire_KOFTR_GROU_Ratio',
+  fileNamePrefix: 'Sancheong_CrownFire_KOFTR_GROU_Ratio_044',
   fileFormat: 'CSV'
 });
 
 Export.table.toDrive({
-  collection: finalFc,
-  description: 'Sancheong_CrownFire_ForestGroup_Ratio',
+  collection: result044.finalFc,
+  description: 'Sancheong_CrownFire_ForestGroup_Ratio_044',
   folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_CrownFire_ForestGroup_Ratio',
+  fileNamePrefix: 'Sancheong_CrownFire_ForestGroup_Ratio_044',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: result044.top10,
+  description: 'Sancheong_TOP10_KOFTR_GROU_044',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_TOP10_KOFTR_GROU_044',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: allFinalFc,
+  description: 'Sancheong_Threshold_Compare_ForestGroup',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_Threshold_Compare_ForestGroup',
+  fileFormat: 'CSV'
+});
+
+Export.table.toDrive({
+  collection: thresholdSummary,
+  description: 'Sancheong_Threshold_Summary',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_Threshold_Summary',
   fileFormat: 'CSV'
 });
 
@@ -486,10 +182,30 @@ Export.image.toDrive({
 });
 
 Export.image.toDrive({
-  image: crownFireMaskClean.toUint8(),
-  description: 'Sancheong_CrownFireMask',
+  image: result044.crownMaskClean.toUint8(),
+  description: 'Sancheong_CrownFireMask_044',
   folder: 'GEE_EXPORT',
-  fileNamePrefix: 'Sancheong_CrownFireMask',
+  fileNamePrefix: 'Sancheong_CrownFireMask_044',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: result050.crownMaskClean.toUint8(),
+  description: 'Sancheong_CrownFireMask_050',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_CrownFireMask_050',
+  region: aoi,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: result066.crownMaskClean.toUint8(),
+  description: 'Sancheong_CrownFireMask_066',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_CrownFireMask_066',
   region: aoi,
   scale: 10,
   maxPixels: 1e13
@@ -513,4 +229,131 @@ Export.image.toDrive({
   region: aoi,
   scale: 10,
   maxPixels: 1e13
+});
+/************************************************************
+ * 자동 해석문 생성 + 종합 판정
+ ************************************************************/
+
+function safeGetPercent(fc, groupName) {
+  var filtered = fc.filter(ee.Filter.eq('group', groupName));
+  return ee.Number(ee.Algorithms.If(
+    filtered.size().gt(0),
+    filtered.first().get('percent'),
+    0
+  ));
+}
+
+function makeInterpretation(resultObj, label) {
+  var conifer = safeGetPercent(resultObj.finalFc, '침엽수림');
+  var mixed = safeGetPercent(resultObj.finalFc, '혼효림');
+  var broad = safeGetPercent(resultObj.finalFc, '활엽수림');
+  var other = safeGetPercent(resultObj.finalFc, '기타');
+
+  var dominant = ee.String(
+    ee.Algorithms.If(
+      conifer.gte(mixed).and(conifer.gte(broad)).and(conifer.gte(other)), '침엽수림',
+      ee.Algorithms.If(
+        mixed.gte(conifer).and(mixed.gte(broad)).and(mixed.gte(other)), '혼효림',
+        ee.Algorithms.If(
+          broad.gte(conifer).and(broad.gte(mixed)).and(broad.gte(other)), '활엽수림',
+          '기타'
+        )
+      )
+    )
+  );
+
+  var sentence = ee.String('threshold ').cat(label)
+    .cat('에서 수관화 후보지역 면적은 ')
+    .cat(ee.Number(resultObj.crownAreaHa).format('%.2f')).cat(' ha이며, ')
+    .cat('침엽수림 ')
+    .cat(conifer.format('%.2f')).cat('%, ')
+    .cat('혼효림 ')
+    .cat(mixed.format('%.2f')).cat('%, ')
+    .cat('활엽수림 ')
+    .cat(broad.format('%.2f')).cat('%, ')
+    .cat('기타 ')
+    .cat(other.format('%.2f')).cat('%로 나타났다. ')
+    .cat('가장 높은 비중은 ')
+    .cat(dominant)
+    .cat('이다.');
+
+  return ee.Feature(null, {
+    threshold: label,
+    crown_area_ha: resultObj.crownAreaHa,
+    conifer_pct: conifer,
+    mixed_pct: mixed,
+    broadleaf_pct: broad,
+    other_pct: other,
+    dominant_group: dominant,
+    interpretation: sentence
+  });
+}
+
+// 1) 해석문 Feature 먼저 생성
+var interp044 = makeInterpretation(result044, '0.44');
+var interp050 = makeInterpretation(result050, '0.50');
+var interp066 = makeInterpretation(result066, '0.66');
+
+// 2) 묶어서 출력
+var interpretationFc = ee.FeatureCollection([interp044, interp050, interp066]);
+
+print('===== 자동 해석문 =====', interpretationFc);
+print('해석문 0.44', interp044.get('interpretation'));
+print('해석문 0.50', interp050.get('interpretation'));
+print('해석문 0.66', interp066.get('interpretation'));
+
+// 3) 종합 판정
+
+var dom044 = ee.String(interp044.get('dominant_group'));
+var dom050 = ee.String(interp050.get('dominant_group'));
+var dom066 = ee.String(interp066.get('dominant_group'));
+
+var same1 = ee.Algorithms.IsEqual(dom044, dom050);
+var same2 = ee.Algorithms.IsEqual(dom050, dom066);
+
+// same1이 true일 때만 same2를 검사
+var isSame = ee.Algorithms.If(same1, same2, false);
+
+var stableMsg = ee.String(
+  ee.Algorithms.If(
+    isSame,
+    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
+      .cat(dom044)
+      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
+    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
+  )
+);
+
+print('===== 종합 판정 =====', stableMsg);
+var stableMsg = ee.String(
+  ee.Algorithms.If(
+    isSame,
+    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
+      .cat(dom044)
+      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
+    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
+  )
+);
+
+print('===== 종합 판정 =====', stableMsg);
+
+var stableMsg = ee.String(
+  ee.Algorithms.If(
+    isSame,
+    ee.String('세 threshold(0.44, 0.50, 0.66) 모두에서 우세 식생유형은 ')
+      .cat(dom044)
+      .cat('으로 동일하게 나타나 결과가 비교적 안정적이다.'),
+    ee.String('threshold에 따라 우세 식생유형이 달라지므로 결과가 임계값 선택에 민감할 가능성이 있다.')
+  )
+);
+
+print('===== 종합 판정 =====', stableMsg);
+
+// 4) export
+Export.table.toDrive({
+  collection: interpretationFc,
+  description: 'Sancheong_Threshold_Interpretation',
+  folder: 'GEE_EXPORT',
+  fileNamePrefix: 'Sancheong_Threshold_Interpretation',
+  fileFormat: 'CSV'
 });
